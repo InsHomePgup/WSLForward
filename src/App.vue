@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import { useI18n } from './i18n/index'
 
 interface DockerMatch {
@@ -68,8 +69,6 @@ function onListenPortChange() {
 const selectedRules = ref<Set<number>>(new Set())
 const activeTab = ref<'diagnostics' | 'docker' | 'console'>('diagnostics')
 const selectedContainer = ref<DockerContainer | null>(null)
-const autoRefresh = ref(false)
-let autoTimer: ReturnType<typeof setInterval> | null = null
 
 interface ConsoleEntry { time: string; level: 'info' | 'error' | 'warn'; msg: string }
 const consoleLogs = ref<ConsoleEntry[]>([])
@@ -198,11 +197,6 @@ function toggleRow(i: number) {
   selectedRules.value = next
 }
 
-function toggleAutoRefresh() {
-  if (autoRefresh.value) { autoTimer = setInterval(refresh, 30000) }
-  else { if (autoTimer) clearInterval(autoTimer); autoTimer = null }
-}
-
 async function restartAsAdmin() {
   clog('Requesting elevation…')
   try {
@@ -214,6 +208,15 @@ async function restartAsAdmin() {
 }
 
 const errorCount = () => consoleLogs.value.filter(l => l.level === 'error').length
+
+let unlistenPortProxy: (() => void) | null = null
+
+function onKeyDown(e: KeyboardEvent) {
+  if (e.ctrlKey && e.key === 'r') {
+    e.preventDefault()
+    refresh()
+  }
+}
 
 const bottomH = ref(200)
 
@@ -239,8 +242,13 @@ onMounted(async () => {
   adminStatus.value = await invoke<boolean>('is_admin')
   await detectIp()
   await refresh()
+  unlistenPortProxy = await listen('portproxy-changed', () => refresh())
+  window.addEventListener('keydown', onKeyDown)
 })
-onUnmounted(() => { if (autoTimer) clearInterval(autoTimer) })
+onUnmounted(() => {
+  unlistenPortProxy?.()
+  window.removeEventListener('keydown', onKeyDown)
+})
 </script>
 
 <template>
@@ -262,16 +270,18 @@ onUnmounted(() => { if (autoTimer) clearInterval(autoTimer) })
           class="h-[26px] px-3 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded bg-white dark:bg-zinc-800 hover:border-blue-500 hover:text-blue-500 cursor-pointer">
           {{ locale === 'en' ? '中文' : 'EN' }}
         </button>
-        <label class="flex items-center gap-1 text-[12px] cursor-pointer">
-          <input type="checkbox" v-model="autoRefresh" @change="toggleAutoRefresh" />
-          {{ t.auto30s }}
-        </label>
         <button :disabled="loading" @click="refresh"
           class="h-[26px] px-3 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded bg-white dark:bg-zinc-800 hover:border-blue-500 hover:text-blue-500 disabled:opacity-40 cursor-pointer">
           {{ loading ? t.loading : t.refresh }}
         </button>
       </div>
     </header>
+
+    <!-- Not-admin warning -->
+    <div v-if="!adminStatus"
+      class="shrink-0 px-3 py-1 bg-amber-50 dark:bg-amber-950 border-b border-amber-200 dark:border-amber-800 text-amber-600 dark:text-amber-400 text-[11px]">
+      {{ t.notAdminHint }}
+    </div>
 
     <!-- WSL IP -->
     <div class="flex items-center gap-2 px-3 py-1.5 bg-white dark:bg-zinc-800 border-b border-zinc-200 dark:border-zinc-700 shrink-0 flex-wrap">
@@ -285,7 +295,8 @@ onUnmounted(() => { if (autoTimer) clearInterval(autoTimer) })
     </div>
 
     <!-- Add Rule -->
-    <div class="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-100 dark:bg-zinc-900 border-b border-zinc-200 dark:border-zinc-700 shrink-0 flex-wrap">
+    <div :class="{ 'opacity-40 pointer-events-none': !adminStatus }"
+      class="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-100 dark:bg-zinc-900 border-b border-zinc-200 dark:border-zinc-700 shrink-0 flex-wrap">
       <span class="text-[12px] text-zinc-500 min-w-[60px] font-medium">{{ t.addRule }}</span>
       <input v-model="listenAddr" :placeholder="t.listenAddrPlaceholder" title="Listen Address"
         class="h-[26px] px-2 w-32 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded bg-white dark:bg-zinc-800 outline-none focus:border-blue-500" />
@@ -356,7 +367,7 @@ onUnmounted(() => { if (autoTimer) clearInterval(autoTimer) })
         </tbody>
       </table>
       <div class="px-2.5 py-1.5 border-t border-zinc-100 dark:border-zinc-700">
-        <button :disabled="selectedRules.size === 0" @click="deleteSelected"
+        <button :disabled="selectedRules.size === 0 || !adminStatus" @click="deleteSelected"
           class="h-[26px] px-3 text-[12px] border border-red-400 text-red-500 rounded hover:bg-red-500 hover:text-white disabled:opacity-30 disabled:cursor-default cursor-pointer">
           {{ t.deleteSelected }}{{ selectedRules.size > 0 ? ` (${selectedRules.size})` : '' }}
         </button>
@@ -428,16 +439,16 @@ onUnmounted(() => { if (autoTimer) clearInterval(autoTimer) })
                 <td class="px-2 py-1 tabular-nums">{{ p.container_port ?? '—' }}</td>
                 <td class="px-2 py-1">{{ p.proto }}</td>
                 <td class="px-2 py-1">
-                  <button @click="forwardPort(p.host_port)"
-                    class="h-[22px] px-2 text-[11px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 cursor-pointer">
+                  <button :disabled="!adminStatus" @click="forwardPort(p.host_port)"
+                    class="h-[22px] px-2 text-[11px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 disabled:opacity-40 disabled:cursor-default cursor-pointer">
                     {{ t.forward }}
                   </button>
                 </td>
               </tr>
             </tbody>
           </table>
-          <button @click="forwardAllPorts(selectedContainer)"
-            class="self-start h-[26px] px-3 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 cursor-pointer">
+          <button :disabled="!adminStatus" @click="forwardAllPorts(selectedContainer)"
+            class="self-start h-[26px] px-3 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 disabled:opacity-40 disabled:cursor-default cursor-pointer">
             {{ t.forwardAll }}
           </button>
         </div>

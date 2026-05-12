@@ -58,6 +58,7 @@ const en = {
   fieldConnectAddr: 'Connect Addr (WSL IP not detected — click Detect)',
   fieldConnectPort: 'Connect Port',
   portRangeError: 'Ports must be between 1 and 65535',
+  notAdminHint: 'Read-only — run as Administrator to add or delete rules',
 }
 
 const zhCN: typeof en = {
@@ -116,6 +117,7 @@ const zhCN: typeof en = {
   fieldConnectAddr: '连接地址（未检测到 WSL IP，请点击检测）',
   fieldConnectPort: '连接端口',
   portRangeError: '端口号必须在 1 到 65535 之间',
+  notAdminHint: '只读模式 — 需以管理员身份运行才能添加或删除规则',
 }
 
 const messages = { en, 'zh-CN': zhCN }

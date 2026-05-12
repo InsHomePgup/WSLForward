@@ -401,12 +401,99 @@ async fn restart_as_admin(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// ── Registry watcher ─────────────────────────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+fn start_registry_watcher(app: tauri::AppHandle) {
+    use std::thread;
+    use std::time::Duration;
+    use tauri::Emitter;
+    use windows::Win32::Foundation::{BOOL, CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegNotifyChangeKeyValue, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_NOTIFY,
+        REG_NOTIFY_CHANGE_LAST_SET, REG_NOTIFY_CHANGE_NAME,
+    };
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    use windows::core::w;
+
+    thread::spawn(move || {
+        // Auto-reset event; used with async RegNotifyChangeKeyValue so the
+        // thread is never permanently blocked and can exit when the app does.
+        let event = match unsafe { CreateEventW(None, BOOL(0), BOOL(0), None) } {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+
+        'outer: loop {
+            let mut hkey = HKEY::default();
+            let opened = unsafe {
+                RegOpenKeyExW(
+                    HKEY_LOCAL_MACHINE,
+                    w!("SYSTEM\\CurrentControlSet\\Services\\PortProxy"),
+                    0,
+                    KEY_NOTIFY,
+                    &mut hkey,
+                )
+                .is_ok()
+            };
+            if !opened {
+                thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+
+            loop {
+                // Register async notification; must re-register after each firing.
+                if !unsafe {
+                    RegNotifyChangeKeyValue(
+                        hkey,
+                        BOOL(1),
+                        REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME,
+                        event,
+                        BOOL(1),
+                    )
+                    .is_ok()
+                } {
+                    break;
+                }
+
+                // Wait up to 5 s; loop on timeout so the thread wakes regularly
+                // and can detect app shutdown via the emit error path.
+                loop {
+                    let r = unsafe { WaitForSingleObject(event, 5_000) };
+                    if r == WAIT_OBJECT_0 {
+                        break; // change detected — re-register and emit
+                    } else if r == WAIT_TIMEOUT {
+                        continue; // still waiting, registration still active
+                    } else {
+                        break 'outer; // WAIT_FAILED or unexpected value
+                    }
+                }
+
+                thread::sleep(Duration::from_millis(300));
+                if app.emit("portproxy-changed", ()).is_err() {
+                    break 'outer; // app is shutting down
+                }
+            }
+
+            unsafe { RegCloseKey(hkey) };
+            thread::sleep(Duration::from_secs(1));
+        }
+
+        unsafe { CloseHandle(event) };
+    });
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(|_app| {
+            #[cfg(target_os = "windows")]
+            start_registry_watcher(_app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             is_admin,
             get_wsl_ip,
