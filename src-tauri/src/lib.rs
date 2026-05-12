@@ -53,23 +53,35 @@ pub struct AllData {
     pub wsl_ports: Vec<u16>,
     pub docker_containers: Vec<DockerContainer>,
     pub errors: Vec<String>,
+    pub debug_log: Vec<String>,
 }
 
 // ── Subprocess helper ────────────────────────────────────────────────────────
 
 fn exec(args: &[&str]) -> Option<String> {
+    exec_debug(args).0
+}
+
+fn exec_debug(args: &[&str]) -> (Option<String>, String) {
     if args.is_empty() {
-        return None;
+        return (None, "empty command".into());
     }
     let mut cmd = Command::new(args[0]);
     cmd.args(&args[1..]);
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
-    let out = cmd.output().ok()?;
-    if out.status.success() {
-        Some(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        None
+    match cmd.output() {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            if out.status.success() {
+                (Some(stdout.clone()), format!("ok ({} bytes)", stdout.len()))
+            } else {
+                let detail = if stderr.is_empty() { format!("exit {}", out.status) } else { stderr.trim().to_string() };
+                (None, detail)
+            }
+        }
+        Err(e) => (None, e.to_string()),
     }
 }
 
@@ -205,22 +217,26 @@ fn parse_docker_output(raw: &str) -> Vec<DockerContainer> {
 
 // ── Data gathering ───────────────────────────────────────────────────────────
 
-fn gather_wsl_ports() -> HashSet<u16> {
+fn gather_wsl_ports() -> (HashSet<u16>, Vec<String>) {
     let fallbacks: &[&[&str]] = &[
         &["wsl", "ss", "-tulpn"],
         &["wsl", "sudo", "ss", "-tulpn"],
         &["wsl", "netstat", "-tulpn"],
         &["wsl", "sudo", "netstat", "-tulpn"],
     ];
+    let mut log = Vec::new();
     for cmd in fallbacks {
-        if let Some(out) = exec(cmd) {
-            let ports = parse_wsl_ports(&out);
-            if !ports.is_empty() {
-                return ports;
-            }
+        let label = cmd.join(" ");
+        let (out, detail) = exec_debug(cmd);
+        if let Some(output) = out {
+            let ports = parse_wsl_ports(&output);
+            log.push(format!("[WSL ports] `{}` → {} ports found\nraw:\n{}", label, ports.len(), output.trim()));
+            return (ports, log);
+        } else {
+            log.push(format!("[WSL ports] `{}` → failed: {}", label, detail));
         }
     }
-    HashSet::new()
+    (HashSet::new(), log)
 }
 
 fn gather_docker_containers() -> Vec<DockerContainer> {
@@ -280,7 +296,7 @@ async fn get_all_data() -> AllData {
             String::new()
         });
 
-    let wsl_ports = gather_wsl_ports();
+    let (wsl_ports, wsl_log) = gather_wsl_ports();
     let docker_containers = gather_docker_containers();
     let raw_rules = parse_netsh(&netsh_raw);
 
@@ -334,6 +350,7 @@ async fn get_all_data() -> AllData {
         wsl_ports: wsl_ports_vec,
         docker_containers,
         errors,
+        debug_log: wsl_log,
     }
 }
 

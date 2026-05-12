@@ -37,17 +37,20 @@ interface AllData {
   wsl_ports: number[]
   docker_containers: DockerContainer[]
   errors: string[]
+  debug_log: string[]
 }
 
 const rules = ref<PortProxyRule[]>([])
 const wslPorts = ref<number[]>([])
 const dockerContainers = ref<DockerContainer[]>([])
 const dataErrors = ref<string[]>([])
+const debugLog = ref<string[]>([])
 
 const wslIp = ref('')
 const adminStatus = ref(false)
 const loading = ref(false)
 const statusMsg = ref('Ready')
+const statusError = ref(false)
 const formError = ref('')
 
 const listenAddr = ref('0.0.0.0')
@@ -81,6 +84,7 @@ async function refresh() {
     wslPorts.value = data.wsl_ports
     dockerContainers.value = data.docker_containers
     dataErrors.value = data.errors
+    debugLog.value = data.debug_log
 
     if (selectedContainer.value) {
       selectedContainer.value =
@@ -88,6 +92,7 @@ async function refresh() {
     }
 
     statusMsg.value = `Updated ${new Date().toLocaleTimeString()}`
+    statusError.value = false
   } catch (e) {
     statusMsg.value = `Refresh failed: ${e}`
   } finally {
@@ -119,7 +124,10 @@ async function addRule() {
     connectAddr.value = wslIp.value
     await refresh()
   } catch (e) {
-    formError.value = String(e)
+    const msg = String(e)
+    formError.value = msg
+    statusMsg.value = `Add rule failed: ${msg}`
+    statusError.value = true
   }
 }
 
@@ -304,6 +312,10 @@ onUnmounted(() => {
         <div v-if="dataErrors.length > 0" class="errors-block">
           <div v-for="e in dataErrors" :key="e" class="error-line">{{ e }}</div>
         </div>
+        <details class="debug-block" v-if="debugLog.length > 0">
+          <summary>Debug Log ({{ debugLog.length }} entries)</summary>
+          <pre v-for="(line, i) in debugLog" :key="i" class="debug-line">{{ line }}</pre>
+        </details>
       </div>
 
       <div v-if="activeTab === 'docker'" class="tab-body docker-layout">
@@ -346,7 +358,7 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <footer class="status-bar">{{ statusMsg }}</footer>
+    <footer :class="['status-bar', { 'status-err': statusError }]">{{ statusMsg }}</footer>
   </div>
 </template>
 
@@ -594,5 +606,33 @@ input:focus { border-color: var(--accent); }
   background: var(--bg);
   border-top: 1px solid var(--border);
   flex-shrink: 0;
+}
+.status-bar.status-err {
+  color: var(--err);
+  background: #fee2e2;
+}
+@media (prefers-color-scheme: dark) {
+  .status-bar.status-err { background: #7f1d1d; }
+}
+.debug-block {
+  margin-top: 10px;
+  font-size: 11px;
+}
+.debug-block summary {
+  cursor: pointer;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.debug-line {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 8px;
+  margin-bottom: 4px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--text);
 }
 </style>
