@@ -281,8 +281,7 @@ async fn get_wsl_ip() -> Result<String, String> {
         "-c",
         r"ip addr show eth0 | grep -oP '(?<=inet\s)\d+(?:\.\d+){3}'",
     ])
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty())
+    .and_then(|s| s.lines().find(|l| !l.trim().is_empty()).map(|l| l.trim().to_string()))
     .ok_or_else(|| "Could not detect WSL IP from eth0".to_string())
 }
 
@@ -388,6 +387,20 @@ async fn forward_port(host_port: u16, wsl_ip: String) -> Result<(), String> {
     add_rule("0.0.0.0".into(), p.clone(), wsl_ip, p).await
 }
 
+#[tauri::command]
+async fn restart_as_admin(app: tauri::AppHandle) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe_str = exe.to_string_lossy().into_owned().replace('\'', "''");
+    let ps_cmd = format!("Start-Process -FilePath '{}' -Verb RunAs", exe_str);
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-WindowStyle", "Hidden", "-Command", &ps_cmd]);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.spawn().map_err(|e| e.to_string())?;
+    app.exit(0);
+    Ok(())
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -401,6 +414,7 @@ pub fn run() {
             add_rule,
             delete_rule,
             forward_port,
+            restart_as_admin,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
