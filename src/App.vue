@@ -58,6 +58,12 @@ const listenPort = ref('')
 const connectAddr = ref('')
 const connectPort = ref('')
 
+function onListenPortChange() {
+  if (!connectPort.value) {
+    connectPort.value = listenPort.value
+  }
+}
+
 const selectedRules = ref<Set<number>>(new Set())
 const activeTab = ref<'diagnostics' | 'docker'>('diagnostics')
 const selectedContainer = ref<DockerContainer | null>(null)
@@ -122,6 +128,7 @@ async function addRule() {
     listenPort.value = ''
     connectPort.value = ''
     connectAddr.value = wslIp.value
+    statusError.value = false
     await refresh()
   } catch (e) {
     const msg = String(e)
@@ -218,7 +225,7 @@ onUnmounted(() => {
     <div class="bar add-bar">
       <span class="label">Add Rule</span>
       <input v-model="listenAddr" class="input-addr" placeholder="Listen Addr" title="Listen Address" />
-      <input v-model="listenPort" class="input-port" placeholder="Port" @keyup.enter="addRule" />
+      <input v-model="listenPort" class="input-port" placeholder="Port" @input="onListenPortChange" @keyup.enter="addRule" />
       <span class="arrow">→</span>
       <input v-model="connectAddr" class="input-addr" placeholder="Connect Addr" title="Connect Address" />
       <input v-model="connectPort" class="input-port" placeholder="Port" @keyup.enter="addRule" />
