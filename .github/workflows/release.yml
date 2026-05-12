@@ -34,7 +34,7 @@ jobs:
           workspaces: './src-tauri -> target'
 
       - name: Install frontend dependencies
-        run: pnpm install
+        run: pnpm install --ignore-scripts
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
