@@ -1,6 +1,8 @@
 # WSLForward
 
-一款轻量级 Windows 桌面应用，用于通过 `netsh portproxy` 管理 WSL2 端口转发规则。
+> 图形化管理 WSL2 端口转发规则（`netsh portproxy`）的 Windows 桌面工具 —— 无需命令行，即可查看、添加、删除转发规则。
+
+一款基于 Tauri + Vue 构建的轻量级 Windows 桌面应用，告别繁琐的 `netsh interface portproxy` 命令。
 
 [English](README.md)
 

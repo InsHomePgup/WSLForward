@@ -1,6 +1,8 @@
 # WSLForward
 
-A lightweight Windows desktop app for managing WSL2 port forwarding rules via `netsh portproxy`.
+> GUI tool to manage `netsh portproxy` port forwarding rules for WSL2 on Windows — view, add, and delete rules without touching the command line.
+
+A lightweight Windows desktop app (built with Tauri + Vue) for managing WSL2 port forwarding. No more manual `netsh interface portproxy` commands.
 
 [中文文档](README.zh-CN.md)
 
