@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'WSLForward ${{ github.ref_name }}'
+          releaseBody: |
+            ## WSLForward ${{ github.ref_name }}
+
+            ### 下载
+            - `WSLForward_x.x.x_x64-setup.exe` — 安装版（推荐）
+            - `WSLForward_x.x.x_x64.msi` — MSI 安装包
+
+            ### 使用说明
+            需要以管理员身份运行以操作 netsh portproxy 规则。
+          releaseDraft: false
+          prerelease: false
