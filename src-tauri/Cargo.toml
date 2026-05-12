@@ -12,9 +12,6 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
-[target.'cfg(target_os = "windows")'.build-dependencies]
-winres = "0.1"
-
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
