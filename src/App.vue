@@ -61,9 +61,14 @@ const listenAddr = ref('0.0.0.0')
 const listenPort = ref('')
 const connectAddr = ref('')
 const connectPort = ref('')
+const connectPortManuallySet = ref(false)
 
 function onListenPortChange() {
-  if (!connectPort.value) connectPort.value = listenPort.value
+  if (!connectPortManuallySet.value) connectPort.value = listenPort.value
+}
+
+function onConnectPortInput() {
+  connectPortManuallySet.value = connectPort.value !== listenPort.value
 }
 
 const selectedRules = ref<Set<number>>(new Set())
@@ -147,7 +152,7 @@ async function addRule() {
   try {
     await invoke('add_rule', { la: listenAddr.value, lp: listenPort.value, ca: connectAddr.value, cp: connectPort.value })
     clog('Rule added successfully')
-    listenPort.value = ''; connectPort.value = ''; connectAddr.value = wslIp.value
+    listenPort.value = ''; connectPort.value = ''; connectAddr.value = wslIp.value; connectPortManuallySet.value = false
     statusError.value = false
     await refresh()
   } catch (e) {
@@ -305,7 +310,7 @@ onUnmounted(() => {
       <span class="text-zinc-400">→</span>
       <input v-model="connectAddr" :placeholder="t.connectAddrPlaceholder" title="Connect Address"
         class="h-[26px] px-2 w-32 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded bg-white dark:bg-zinc-800 outline-none focus:border-blue-500" />
-      <input v-model="connectPort" :placeholder="t.portPlaceholder" @keyup.enter="addRule"
+      <input v-model="connectPort" :placeholder="t.portPlaceholder" @input="onConnectPortInput" @keyup.enter="addRule"
         class="h-[26px] px-2 w-16 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded bg-white dark:bg-zinc-800 outline-none focus:border-blue-500" />
       <button @click="addRule"
         class="h-[26px] px-3 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded bg-white dark:bg-zinc-800 hover:border-blue-500 hover:text-blue-500 cursor-pointer">
