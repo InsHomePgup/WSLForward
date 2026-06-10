@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, watch, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import { useI18n } from './i18n/index'
@@ -63,13 +63,13 @@ const connectAddr = ref('')
 const connectPort = ref('')
 const connectPortManuallySet = ref(false)
 
-function onListenPortChange() {
-  if (!connectPortManuallySet.value) connectPort.value = listenPort.value
-}
+watch(listenPort, (val) => {
+  if (!connectPortManuallySet.value) connectPort.value = val
+})
 
-function onConnectPortInput() {
-  connectPortManuallySet.value = connectPort.value !== listenPort.value
-}
+watch(connectPort, (val) => {
+  connectPortManuallySet.value = val !== listenPort.value
+})
 
 const selectedRules = ref<Set<number>>(new Set())
 const activeTab = ref<'diagnostics' | 'docker' | 'console'>('diagnostics')
@@ -291,12 +291,12 @@ onUnmounted(() => {
           <span class="text-[11px] text-zinc-400 font-medium mr-1 whitespace-nowrap">{{ t.addRule }}</span>
           <input v-model="listenAddr" :placeholder="t.listenAddrPlaceholder" title="Listen Address"
             class="h-[26px] px-2 w-28 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded bg-white dark:bg-zinc-700 outline-none focus:border-blue-500" />
-          <input v-model="listenPort" :placeholder="t.portPlaceholder" @input="onListenPortChange" @keyup.enter="addRule"
+          <input v-model="listenPort" :placeholder="t.portPlaceholder" @keyup.enter="addRule"
             class="h-[26px] px-2 w-14 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded bg-white dark:bg-zinc-700 outline-none focus:border-blue-500" />
           <span class="text-zinc-300 dark:text-zinc-600">→</span>
           <input v-model="connectAddr" :placeholder="t.connectAddrPlaceholder" title="Connect Address"
             class="h-[26px] px-2 w-28 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded bg-white dark:bg-zinc-700 outline-none focus:border-blue-500" />
-          <input v-model="connectPort" :placeholder="t.portPlaceholder" @input="onConnectPortInput" @keyup.enter="addRule"
+          <input v-model="connectPort" :placeholder="t.portPlaceholder" @keyup.enter="addRule"
             class="h-[26px] px-2 w-14 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded bg-white dark:bg-zinc-700 outline-none focus:border-blue-500" />
           <button @click="addRule"
             class="h-[26px] px-3 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 cursor-pointer">
