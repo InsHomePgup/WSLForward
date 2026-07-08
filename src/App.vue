@@ -17,6 +17,7 @@ interface PortProxyRule {
   connect_addr: string
   connect_port: string
   win_open: boolean
+  firewall_open: boolean
   wsl_running: boolean
   docker_matches: DockerMatch[]
 }
@@ -192,6 +193,19 @@ async function forwardPort(port: number) {
   }
 }
 
+async function toggleFirewall(rule: PortProxyRule) {
+  const opening = !rule.firewall_open
+  clog(`${opening ? 'Opening' : 'Closing'} LAN access for port ${rule.listen_port}`)
+  try {
+    await invoke(opening ? 'add_firewall_rule' : 'remove_firewall_rule', { port: rule.listen_port })
+    clog(`LAN access ${opening ? 'opened' : 'closed'} for port ${rule.listen_port}`)
+    await refresh()
+  } catch (e) {
+    statusMsg.value = `${t.value.firewallFailed}: ${e}`
+    clog(`Firewall toggle failed: ${e}`, 'error')
+  }
+}
+
 async function forwardAllPorts(container: DockerContainer) {
   for (const p of container.ports) await forwardPort(p.host_port)
 }
@@ -318,6 +332,7 @@ onUnmounted(() => {
                 <th class="px-3 py-2 text-left font-semibold border-b border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400">{{ t.colConnectAddr }}</th>
                 <th class="px-3 py-2 text-left font-semibold border-b border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400">{{ t.colPort }}</th>
                 <th class="px-3 py-2 text-left font-semibold border-b border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400">{{ t.colWindows }}</th>
+                <th class="px-3 py-2 text-left font-semibold border-b border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400">{{ t.colLan }}</th>
                 <th class="px-3 py-2 text-left font-semibold border-b border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400">{{ t.colWsl }}</th>
                 <th class="px-3 py-2 text-left font-semibold border-b border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400">{{ t.colDocker }}</th>
               </tr>
@@ -348,6 +363,18 @@ onUnmounted(() => {
                     {{ rule.win_open ? t.statusOpen : t.statusClosed }}
                   </span>
                 </td>
+                <td class="px-3 py-2" @click.stop>
+                  <div class="flex items-center gap-1.5">
+                    <span :class="rule.firewall_open ? 'bg-green-100 text-green-700 dark:bg-green-900/60 dark:text-green-400' : 'bg-zinc-100 text-zinc-400 dark:bg-zinc-700 dark:text-zinc-500'"
+                      class="px-1.5 py-0.5 rounded text-[10px] font-semibold">
+                      {{ rule.firewall_open ? t.statusOpen : t.statusClosed }}
+                    </span>
+                    <button :disabled="!adminStatus" @click="toggleFirewall(rule)"
+                      class="h-[20px] px-1.5 text-[10px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 disabled:opacity-40 disabled:cursor-default cursor-pointer whitespace-nowrap">
+                      {{ rule.firewall_open ? t.blockLan : t.allowLan }}
+                    </button>
+                  </div>
+                </td>
                 <td class="px-3 py-2">
                   <span :class="rule.wsl_running ? 'bg-green-100 text-green-700 dark:bg-green-900/60 dark:text-green-400' : 'bg-zinc-100 text-zinc-400 dark:bg-zinc-700 dark:text-zinc-500'"
                     class="px-1.5 py-0.5 rounded text-[10px] font-semibold">
@@ -363,7 +390,7 @@ onUnmounted(() => {
                 </td>
               </tr>
               <tr v-if="rules.length === 0">
-                <td colspan="8" class="px-3 py-8 text-center text-zinc-400">{{ t.noRules }}</td>
+                <td colspan="9" class="px-3 py-8 text-center text-zinc-400">{{ t.noRules }}</td>
               </tr>
             </tbody>
           </table>

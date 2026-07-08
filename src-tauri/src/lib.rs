@@ -20,6 +20,7 @@ pub struct PortProxyRule {
     pub connect_addr: String,
     pub connect_port: String,
     pub win_open: bool,
+    pub firewall_open: bool,
     pub wsl_running: bool,
     pub docker_matches: Vec<DockerMatch>,
 }
@@ -143,6 +144,40 @@ fn parse_netsh(raw: &str) -> Vec<(String, String, String, String)> {
         .collect()
 }
 
+// PowerShell's NetSecurity cmdlets return .NET enum/property values (always
+// English), unlike `netsh advfirewall` text output, which Windows localizes
+// to the OS display language — so this is parsed instead of netsh's output.
+fn parse_firewall_ports(raw: &str) -> Vec<(String, String)> {
+    raw.lines()
+        .filter_map(|l| l.split_once('|'))
+        .map(|(protocol, local_port)| (protocol.trim().to_string(), local_port.trim().to_string()))
+        .collect()
+}
+
+fn local_port_matches(spec: &str, port: u16) -> bool {
+    if spec.eq_ignore_ascii_case("any") {
+        return true;
+    }
+    spec.split(',').any(|tok| {
+        let tok = tok.trim();
+        if let Some((s, e)) = tok.split_once('-') {
+            match (s.trim().parse::<u16>(), e.trim().parse::<u16>()) {
+                (Ok(s), Ok(e)) => port >= s && port <= e,
+                _ => false,
+            }
+        } else {
+            tok.parse::<u16>().map(|p| p == port).unwrap_or(false)
+        }
+    })
+}
+
+fn firewall_port_open(rules: &[(String, String)], port: u16) -> bool {
+    rules.iter().any(|(protocol, local_port)| {
+        (protocol.eq_ignore_ascii_case("tcp") || protocol.eq_ignore_ascii_case("any"))
+            && local_port_matches(local_port, port)
+    })
+}
+
 fn parse_wsl_ports(output: &str) -> HashSet<u16> {
     let mut ports = HashSet::new();
     for line in output.lines() {
@@ -239,6 +274,23 @@ fn gather_wsl_ports() -> (HashSet<u16>, Vec<String>) {
     (HashSet::new(), log)
 }
 
+const FIREWALL_LIST_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+try {
+    Get-NetFirewallRule -Direction Inbound | Where-Object { $_.Enabled -eq 'True' -and $_.Action -eq 'Allow' } | ForEach-Object { $_ | Get-NetFirewallPortFilter } | ForEach-Object { "$($_.Protocol)|$($_.LocalPort -join ',')" }
+} catch {
+    Write-Error $_
+    exit 1
+}
+"#;
+
+fn gather_firewall_rules() -> (Vec<(String, String)>, Option<String>) {
+    match exec(&["powershell", "-NoProfile", "-NonInteractive", "-Command", FIREWALL_LIST_SCRIPT]) {
+        Some(out) => (parse_firewall_ports(&out), None),
+        None => (Vec::new(), Some("Get-NetFirewallRule failed — could not read firewall rules".to_string())),
+    }
+}
+
 fn gather_docker_containers() -> Vec<DockerContainer> {
     let fmt = "{{.ID}} {{.Names}} {{.Ports}}";
     let fallbacks: &[&[&str]] = &[
@@ -299,6 +351,11 @@ async fn get_all_data() -> AllData {
     let docker_containers = gather_docker_containers();
     let raw_rules = parse_netsh(&netsh_raw);
 
+    let (fw_rules, fw_error) = gather_firewall_rules();
+    if let Some(e) = fw_error {
+        errors.push(e);
+    }
+
     let rules = raw_rules
         .into_iter()
         .map(|(la, lp, ca, cp)| {
@@ -307,7 +364,9 @@ async fn get_all_data() -> AllData {
             } else {
                 &la
             };
+            let lp_u16: u16 = lp.parse().unwrap_or(0);
             let win_open = lp.parse::<u16>().map(|p| port_open(check_host, p)).unwrap_or(false);
+            let firewall_open = firewall_port_open(&fw_rules, lp_u16);
             let cp_u16: u16 = cp.parse().unwrap_or(0);
             let wsl_running = wsl_ports.contains(&cp_u16);
 
@@ -335,6 +394,7 @@ async fn get_all_data() -> AllData {
                 connect_addr: ca,
                 connect_port: cp,
                 win_open,
+                firewall_open,
                 wsl_running,
                 docker_matches,
             }
@@ -379,6 +439,58 @@ async fn delete_rule(la: String, lp: String) -> Result<(), String> {
         &format!("listenaddress={}", la),
         &format!("listenport={}", lp),
     ])
+}
+
+fn firewall_rule_name(port: u16) -> String {
+    format!("WSLForward-{}", port)
+}
+
+fn run_firewall_script(script: &str) -> Result<(), String> {
+    exec_checked(&["powershell", "-NoProfile", "-NonInteractive", "-Command", script])
+}
+
+#[tauri::command]
+async fn add_firewall_rule(port: String) -> Result<(), String> {
+    let port: u16 = port.parse().map_err(|_| "Invalid port".to_string())?;
+    let name = firewall_rule_name(port);
+    // `name`/`port` are a fixed prefix + a validated u16, so interpolating them
+    // into the script below can't break out of the quoted PowerShell literals.
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+try {{
+    Remove-NetFirewallRule -Name '{name}' -ErrorAction SilentlyContinue | Out-Null
+    New-NetFirewallRule -Name '{name}' -DisplayName '{name}' -Direction Inbound -Action Allow -Protocol TCP -LocalPort {port} -Profile Any | Out-Null
+}} catch {{
+    Write-Error $_
+    exit 1
+}}
+"#,
+        name = name,
+        port = port,
+    );
+    run_firewall_script(&script)
+}
+
+#[tauri::command]
+async fn remove_firewall_rule(port: String) -> Result<(), String> {
+    let port: u16 = port.parse().map_err(|_| "Invalid port".to_string())?;
+    let name = firewall_rule_name(port);
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+try {{
+    if (Get-NetFirewallRule -Name '{name}' -ErrorAction SilentlyContinue) {{
+        Remove-NetFirewallRule -Name '{name}'
+    }}
+}} catch {{
+    Write-Error $_
+    exit 1
+}}
+"#,
+        name = name,
+    );
+    run_firewall_script(&script)
 }
 
 #[tauri::command]
@@ -500,6 +612,8 @@ pub fn run() {
             get_all_data,
             add_rule,
             delete_rule,
+            add_firewall_rule,
+            remove_firewall_rule,
             forward_port,
             restart_as_admin,
         ])
