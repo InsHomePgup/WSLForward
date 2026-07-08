@@ -15,6 +15,7 @@ WSL2 runs in a virtual machine with its own IP address that changes on every res
 WSLForward gives you a GUI to:
 - View all active portproxy rules at a glance
 - Add and delete rules without touching the command line
+- Open/close a Windows Firewall rule with one click to let LAN devices reach a forwarded port
 - See which WSL ports are actually listening
 - Detect and integrate with Docker containers running inside WSL2
 - Re-launch as Administrator with one click if needed
@@ -40,10 +41,11 @@ No additional runtime required — WebView2 is pre-installed on Windows 10/11.
 2. The app auto-detects your WSL2 IP on startup
 3. **Add Rule** — enter listen address, listen port, connect address, connect port, then click Add
 4. Click any rule row to select it; use **Delete Selected** to remove
-5. The **Diagnostics** tab shows WSL listening ports and debug output
-6. The **Docker** tab lists running containers and lets you forward their ports in one click
-7. Use the resize handle between the rules table and the bottom panel to adjust layout
-8. Switch between **English** and **中文** with the language button in the header
+5. In the **LAN** column, click **Allow LAN** to open a firewall rule for that port so other devices on the network can reach it; click **Block LAN** to revoke it
+6. The **Diagnostics** tab shows WSL listening ports and debug output
+7. The **Docker** tab lists running containers and lets you forward their ports in one click
+8. Use the resize handle between the rules table and the bottom panel to adjust layout
+9. Switch between **English** and **中文** with the language button in the header
 
 ## Build from Source
 
