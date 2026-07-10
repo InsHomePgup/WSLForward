@@ -155,9 +155,6 @@ fn parse_firewall_ports(raw: &str) -> Vec<(String, String)> {
 }
 
 fn local_port_matches(spec: &str, port: u16) -> bool {
-    if spec.eq_ignore_ascii_case("any") {
-        return true;
-    }
     spec.split(',').any(|tok| {
         let tok = tok.trim();
         if let Some((s, e)) = tok.split_once('-') {
@@ -171,6 +168,15 @@ fn local_port_matches(spec: &str, port: u16) -> bool {
     })
 }
 
+// A rule with LocalPort=Any is never treated as opening our specific target port,
+// even when Get-NetFirewallApplicationFilter reports Program as "Any" or "System".
+// Verified against a live system: LocalPort=Any/Program=System rules (e.g. WFD
+// service discovery, IGMP, IPv6 core networking) and LocalPort=Any/Program=Any
+// rules (UWP app-package rules, scoped by a Package SID that isn't exposed via
+// the Program field) both leave arbitrary TCP ports genuinely closed in practice
+// — confirmed empirically, since LAN access to a port stayed blocked despite
+// several such rules already being enabled. So only an exact/range numeric
+// LocalPort match is trusted as evidence the target port is actually open.
 fn firewall_port_open(rules: &[(String, String)], port: u16) -> bool {
     rules.iter().any(|(protocol, local_port)| {
         (protocol.eq_ignore_ascii_case("tcp") || protocol.eq_ignore_ascii_case("any"))
