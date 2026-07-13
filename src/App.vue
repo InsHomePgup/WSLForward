@@ -53,10 +53,25 @@ const debugLog = ref<string[]>([])
 
 const wslIp = ref('')
 const adminStatus = ref(false)
-const loading = ref(false)
 const statusMsg = ref(t.value.statusReady)
 const statusError = ref(false)
 const formError = ref('')
+
+const busyKeys = ref<Set<string>>(new Set())
+function isBusy(key: string) {
+  return busyKeys.value.has(key)
+}
+async function withBusy<T>(key: string, fn: () => Promise<T>): Promise<T | undefined> {
+  if (busyKeys.value.has(key)) return
+  busyKeys.value = new Set(busyKeys.value).add(key)
+  try {
+    return await fn()
+  } finally {
+    const next = new Set(busyKeys.value)
+    next.delete(key)
+    busyKeys.value = next
+  }
+}
 
 const listenAddr = ref('0.0.0.0')
 const listenPort = ref('')
@@ -90,42 +105,42 @@ function tabLabel(tab: 'diagnostics' | 'docker' | 'console'): string {
 }
 
 async function detectIp() {
-  clog('Detecting WSL IP…')
-  try {
-    const ip = await invoke<string>('get_wsl_ip')
-    wslIp.value = ip
-    connectAddr.value = ip
-    clog(`WSL IP detected: ${ip}`)
-  } catch (e) {
-    statusMsg.value = t.value.wslIpFailed
-    clog(`WSL IP detection failed: ${e}`, 'error')
-  }
+  await withBusy('detectIp', async () => {
+    clog('Detecting WSL IP…')
+    try {
+      const ip = await invoke<string>('get_wsl_ip')
+      wslIp.value = ip
+      connectAddr.value = ip
+      clog(`WSL IP detected: ${ip}`)
+    } catch (e) {
+      statusMsg.value = t.value.wslIpFailed
+      clog(`WSL IP detection failed: ${e}`, 'error')
+    }
+  })
 }
 
 async function refresh() {
-  if (loading.value) return
-  loading.value = true
-  statusMsg.value = t.value.statusRefreshing
-  try {
-    const data = await invoke<AllData>('get_all_data')
-    rules.value = data.rules
-    wslPorts.value = data.wsl_ports
-    dockerContainers.value = data.docker_containers
-    dataErrors.value = data.errors
-    debugLog.value = data.debug_log
-    if (selectedContainer.value)
-      selectedContainer.value = data.docker_containers.find(c => c.id === selectedContainer.value!.id) ?? null
-    data.errors.forEach(e => clog(e, 'error'))
-    data.debug_log.forEach(l => clog(l))
-    clog(`Refresh OK — ${data.rules.length} rules, ${data.wsl_ports.length} WSL ports, ${data.docker_containers.length} containers`)
-    statusMsg.value = `${t.value.updatedAt} ${new Date().toLocaleTimeString()}`
-    statusError.value = false
-  } catch (e) {
-    statusMsg.value = `${t.value.refreshFailed}: ${e}`
-    clog(`Refresh failed: ${e}`, 'error')
-  } finally {
-    loading.value = false
-  }
+  await withBusy('refresh', async () => {
+    statusMsg.value = t.value.statusRefreshing
+    try {
+      const data = await invoke<AllData>('get_all_data')
+      rules.value = data.rules
+      wslPorts.value = data.wsl_ports
+      dockerContainers.value = data.docker_containers
+      dataErrors.value = data.errors
+      debugLog.value = data.debug_log
+      if (selectedContainer.value)
+        selectedContainer.value = data.docker_containers.find(c => c.id === selectedContainer.value!.id) ?? null
+      data.errors.forEach(e => clog(e, 'error'))
+      data.debug_log.forEach(l => clog(l))
+      clog(`Refresh OK — ${data.rules.length} rules, ${data.wsl_ports.length} WSL ports, ${data.docker_containers.length} containers`)
+      statusMsg.value = `${t.value.updatedAt} ${new Date().toLocaleTimeString()}`
+      statusError.value = false
+    } catch (e) {
+      statusMsg.value = `${t.value.refreshFailed}: ${e}`
+      clog(`Refresh failed: ${e}`, 'error')
+    }
+  })
 }
 
 async function addRule() {
@@ -149,65 +164,75 @@ async function addRule() {
     clog(`Add rule validation failed: ${msg}`, 'warn')
     return
   }
-  clog(`Adding rule: ${listenAddr.value}:${listenPort.value} → ${connectAddr.value}:${connectPort.value}`)
-  try {
-    await invoke('add_rule', { la: listenAddr.value, lp: listenPort.value, ca: connectAddr.value, cp: connectPort.value })
-    clog('Rule added successfully')
-    listenPort.value = ''; connectPort.value = ''; connectAddr.value = wslIp.value; connectPortManuallySet.value = false
-    statusError.value = false
-    await refresh()
-  } catch (e) {
-    const msg = String(e)
-    formError.value = msg; statusMsg.value = `${t.value.addFailed}: ${msg}`; statusError.value = true
-    clog(`Add rule failed: ${msg}`, 'error')
-  }
+  await withBusy('addRule', async () => {
+    clog(`Adding rule: ${listenAddr.value}:${listenPort.value} → ${connectAddr.value}:${connectPort.value}`)
+    try {
+      await invoke('add_rule', { la: listenAddr.value, lp: listenPort.value, ca: connectAddr.value, cp: connectPort.value })
+      clog('Rule added successfully')
+      listenPort.value = ''; connectPort.value = ''; connectAddr.value = wslIp.value; connectPortManuallySet.value = false
+      statusError.value = false
+      await refresh()
+    } catch (e) {
+      const msg = String(e)
+      formError.value = msg; statusMsg.value = `${t.value.addFailed}: ${msg}`; statusError.value = true
+      clog(`Add rule failed: ${msg}`, 'error')
+    }
+  })
 }
 
 async function deleteSelected() {
   if (selectedRules.value.size === 0) return
-  const toDelete = [...selectedRules.value].map(i => rules.value[i])
-  for (const rule of toDelete) {
-    clog(`Deleting rule: ${rule.listen_addr}:${rule.listen_port}`)
-    try {
-      await invoke('delete_rule', { la: rule.listen_addr, lp: rule.listen_port })
-      clog(`Deleted: ${rule.listen_addr}:${rule.listen_port}`)
-    } catch (e) {
-      statusMsg.value = `${t.value.deleteFailed}: ${e}`
-      clog(`Delete failed: ${e}`, 'error')
+  await withBusy('deleteSelected', async () => {
+    const toDelete = [...selectedRules.value].map(i => rules.value[i])
+    for (const rule of toDelete) {
+      clog(`Deleting rule: ${rule.listen_addr}:${rule.listen_port}`)
+      try {
+        await invoke('delete_rule', { la: rule.listen_addr, lp: rule.listen_port })
+        clog(`Deleted: ${rule.listen_addr}:${rule.listen_port}`)
+      } catch (e) {
+        statusMsg.value = `${t.value.deleteFailed}: ${e}`
+        clog(`Delete failed: ${e}`, 'error')
+      }
     }
-  }
-  selectedRules.value = new Set()
-  await refresh()
+    selectedRules.value = new Set()
+    await refresh()
+  })
 }
 
 async function forwardPort(port: number) {
   if (!wslIp.value) { statusMsg.value = t.value.wslIpNotSet; clog('Forward failed: WSL IP not set', 'warn'); return }
-  clog(`Forwarding port ${port} → ${wslIp.value}:${port}`)
-  try {
-    await invoke('forward_port', { hostPort: port, wslIp: wslIp.value })
-    clog(`Port ${port} forwarded`)
-    await refresh()
-  } catch (e) {
-    statusMsg.value = `${t.value.forwardFailed}: ${e}`
-    clog(`Forward port ${port} failed: ${e}`, 'error')
-  }
+  await withBusy(`forward:${port}`, async () => {
+    clog(`Forwarding port ${port} → ${wslIp.value}:${port}`)
+    try {
+      await invoke('forward_port', { hostPort: port, wslIp: wslIp.value })
+      clog(`Port ${port} forwarded`)
+      await refresh()
+    } catch (e) {
+      statusMsg.value = `${t.value.forwardFailed}: ${e}`
+      clog(`Forward port ${port} failed: ${e}`, 'error')
+    }
+  })
 }
 
 async function toggleFirewall(rule: PortProxyRule) {
   const opening = !rule.firewall_open
-  clog(`${opening ? 'Opening' : 'Closing'} LAN access for port ${rule.listen_port}`)
-  try {
-    await invoke(opening ? 'add_firewall_rule' : 'remove_firewall_rule', { port: rule.listen_port })
-    clog(`LAN access ${opening ? 'opened' : 'closed'} for port ${rule.listen_port}`)
-    await refresh()
-  } catch (e) {
-    statusMsg.value = `${t.value.firewallFailed}: ${e}`
-    clog(`Firewall toggle failed: ${e}`, 'error')
-  }
+  await withBusy(`firewall:${rule.listen_port}`, async () => {
+    clog(`${opening ? 'Opening' : 'Closing'} LAN access for port ${rule.listen_port}`)
+    try {
+      await invoke(opening ? 'add_firewall_rule' : 'remove_firewall_rule', { port: rule.listen_port })
+      clog(`LAN access ${opening ? 'opened' : 'closed'} for port ${rule.listen_port}`)
+      await refresh()
+    } catch (e) {
+      statusMsg.value = `${t.value.firewallFailed}: ${e}`
+      clog(`Firewall toggle failed: ${e}`, 'error')
+    }
+  })
 }
 
 async function forwardAllPorts(container: DockerContainer) {
-  for (const p of container.ports) await forwardPort(p.host_port)
+  await withBusy(`forwardAll:${container.id}`, async () => {
+    for (const p of container.ports) await forwardPort(p.host_port)
+  })
 }
 
 function toggleRow(i: number) {
@@ -217,13 +242,15 @@ function toggleRow(i: number) {
 }
 
 async function restartAsAdmin() {
-  clog('Requesting elevation…')
-  try {
-    await invoke('restart_as_admin')
-  } catch (e) {
-    statusMsg.value = String(e)
-    clog(`Elevation failed: ${e}`, 'error')
-  }
+  await withBusy('restartAsAdmin', async () => {
+    clog('Requesting elevation…')
+    try {
+      await invoke('restart_as_admin')
+    } catch (e) {
+      statusMsg.value = String(e)
+      clog(`Elevation failed: ${e}`, 'error')
+    }
+  })
 }
 
 const errorCount = () => consoleLogs.value.filter(l => l.level === 'error').length
@@ -261,17 +288,19 @@ onUnmounted(() => {
           class="px-2 py-0.5 rounded text-[11px] font-semibold">
           {{ adminStatus ? t.adminBadge : t.notAdminBadge }}
         </span>
-        <button v-if="!adminStatus" @click="restartAsAdmin"
-          class="h-[26px] px-3 text-[12px] border border-amber-400 text-amber-600 dark:border-amber-500 dark:text-amber-400 rounded hover:bg-amber-500 hover:text-white hover:border-amber-500 cursor-pointer">
+        <button v-if="!adminStatus" :disabled="isBusy('restartAsAdmin')" @click="restartAsAdmin"
+          class="h-[26px] px-3 text-[12px] border border-amber-400 text-amber-600 dark:border-amber-500 dark:text-amber-400 rounded hover:bg-amber-500 hover:text-white hover:border-amber-500 disabled:opacity-40 cursor-pointer inline-flex items-center gap-1.5">
+          <span v-if="isBusy('restartAsAdmin')" class="inline-block w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
           {{ t.runAsAdmin }}
         </button>
         <button @click="setLocale(locale === 'en' ? 'zh-CN' : 'en')"
           class="h-[26px] px-3 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 cursor-pointer">
           {{ locale === 'en' ? '中文' : 'EN' }}
         </button>
-        <button :disabled="loading" @click="refresh"
-          class="h-[26px] px-3 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 disabled:opacity-40 cursor-pointer">
-          {{ loading ? t.loading : t.refresh }}
+        <button :disabled="isBusy('refresh')" @click="refresh"
+          class="h-[26px] px-3 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 disabled:opacity-40 cursor-pointer inline-flex items-center gap-1.5">
+          <span v-if="isBusy('refresh')" class="inline-block w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
+          {{ t.refresh }}
         </button>
       </div>
     </header>
@@ -293,8 +322,9 @@ onUnmounted(() => {
           <span class="text-[11px] text-zinc-400 font-medium whitespace-nowrap">{{ t.wslIp }}</span>
           <input v-model="wslIp" placeholder="172.x.x.x"
             class="h-[26px] px-2 w-32 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded bg-white dark:bg-zinc-700 outline-none focus:border-blue-500" />
-          <button @click="detectIp"
-            class="h-[26px] px-3 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 cursor-pointer whitespace-nowrap">
+          <button :disabled="isBusy('detectIp')" @click="detectIp"
+            class="h-[26px] px-3 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 disabled:opacity-40 cursor-pointer whitespace-nowrap inline-flex items-center gap-1.5">
+            <span v-if="isBusy('detectIp')" class="inline-block w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
             {{ t.detect }}
           </button>
         </div>
@@ -312,8 +342,9 @@ onUnmounted(() => {
             class="h-[26px] px-2 w-28 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded bg-white dark:bg-zinc-700 outline-none focus:border-blue-500" />
           <input v-model="connectPort" :placeholder="t.portPlaceholder" @keyup.enter="addRule"
             class="h-[26px] px-2 w-14 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded bg-white dark:bg-zinc-700 outline-none focus:border-blue-500" />
-          <button @click="addRule"
-            class="h-[26px] px-3 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 cursor-pointer">
+          <button :disabled="isBusy('addRule')" @click="addRule"
+            class="h-[26px] px-3 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 disabled:opacity-40 cursor-pointer inline-flex items-center gap-1.5">
+            <span v-if="isBusy('addRule')" class="inline-block w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
             {{ t.add }}
           </button>
           <span v-if="formError" class="text-[11px] text-red-500">{{ formError }}</span>
@@ -369,8 +400,9 @@ onUnmounted(() => {
                       class="px-1.5 py-0.5 rounded text-[10px] font-semibold">
                       {{ rule.firewall_open ? t.statusOpen : t.statusClosed }}
                     </span>
-                    <button :disabled="!adminStatus" @click="toggleFirewall(rule)"
-                      class="h-[20px] px-1.5 text-[10px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 disabled:opacity-40 disabled:cursor-default cursor-pointer whitespace-nowrap">
+                    <button :disabled="!adminStatus || isBusy(`firewall:${rule.listen_port}`)" @click="toggleFirewall(rule)"
+                      class="h-[20px] px-1.5 text-[10px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 disabled:opacity-40 disabled:cursor-default cursor-pointer whitespace-nowrap inline-flex items-center gap-1">
+                      <span v-if="isBusy(`firewall:${rule.listen_port}`)" class="inline-block w-2.5 h-2.5 border-2 border-current border-t-transparent rounded-full animate-spin" />
                       {{ rule.firewall_open ? t.blockLan : t.allowLan }}
                     </button>
                   </div>
@@ -396,8 +428,9 @@ onUnmounted(() => {
           </table>
         </div>
         <div class="shrink-0 px-3 py-2 border-t border-zinc-100 dark:border-zinc-700">
-          <button :disabled="selectedRules.size === 0 || !adminStatus" @click="deleteSelected"
-            class="h-[26px] px-3 text-[12px] border border-red-300 text-red-500 rounded hover:bg-red-500 hover:text-white hover:border-red-500 disabled:opacity-30 disabled:cursor-default cursor-pointer">
+          <button :disabled="selectedRules.size === 0 || !adminStatus || isBusy('deleteSelected')" @click="deleteSelected"
+            class="h-[26px] px-3 text-[12px] border border-red-300 text-red-500 rounded hover:bg-red-500 hover:text-white hover:border-red-500 disabled:opacity-30 disabled:cursor-default cursor-pointer inline-flex items-center gap-1.5">
+            <span v-if="isBusy('deleteSelected')" class="inline-block w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
             {{ t.deleteSelected }}{{ selectedRules.size > 0 ? ` (${selectedRules.size})` : '' }}
           </button>
         </div>
@@ -477,16 +510,18 @@ onUnmounted(() => {
                   </td>
                   <td class="px-2 py-1.5 text-zinc-500 dark:text-zinc-400">{{ p.proto }}</td>
                   <td class="px-2 py-1.5">
-                    <button :disabled="!adminStatus" @click="forwardPort(p.host_port)"
-                      class="h-[22px] px-2 text-[11px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 disabled:opacity-40 disabled:cursor-default cursor-pointer">
+                    <button :disabled="!adminStatus || isBusy(`forward:${p.host_port}`)" @click="forwardPort(p.host_port)"
+                      class="h-[22px] px-2 text-[11px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 disabled:opacity-40 disabled:cursor-default cursor-pointer inline-flex items-center gap-1">
+                      <span v-if="isBusy(`forward:${p.host_port}`)" class="inline-block w-2.5 h-2.5 border-2 border-current border-t-transparent rounded-full animate-spin" />
                       {{ t.forward }}
                     </button>
                   </td>
                 </tr>
               </tbody>
             </table>
-            <button :disabled="!adminStatus" @click="forwardAllPorts(selectedContainer)"
-              class="self-start h-[26px] px-3 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 disabled:opacity-40 disabled:cursor-default cursor-pointer">
+            <button :disabled="!adminStatus || isBusy(`forwardAll:${selectedContainer.id}`)" @click="forwardAllPorts(selectedContainer)"
+              class="self-start h-[26px] px-3 text-[12px] border border-zinc-300 dark:border-zinc-600 rounded hover:border-blue-500 hover:text-blue-500 disabled:opacity-40 disabled:cursor-default cursor-pointer inline-flex items-center gap-1.5">
+              <span v-if="isBusy(`forwardAll:${selectedContainer.id}`)" class="inline-block w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
               {{ t.forwardAll }}
             </button>
           </div>
