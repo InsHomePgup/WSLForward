@@ -71,6 +71,7 @@ fn exec_debug(args: &[&str]) -> (Option<String>, String) {
     if args.is_empty() {
         return (None, "empty command".into());
     }
+    let start = Instant::now();
     let mut cmd = Command::new(args[0]);
     cmd.args(&args[1..]);
     cmd.stdout(Stdio::piped());
@@ -80,7 +81,7 @@ fn exec_debug(args: &[&str]) -> (Option<String>, String) {
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return (None, e.to_string()),
+        Err(e) => return (None, format!("{e} ({:?})", start.elapsed())),
     };
 
     // Drain stdout/stderr on separate threads while we poll for exit, so a
@@ -103,7 +104,7 @@ fn exec_debug(args: &[&str]) -> (Option<String>, String) {
         buf
     });
 
-    let deadline = Instant::now() + EXEC_TIMEOUT;
+    let deadline = start + EXEC_TIMEOUT;
     let mut wait_err = None;
     let status = loop {
         match child.try_wait() {
@@ -127,9 +128,10 @@ fn exec_debug(args: &[&str]) -> (Option<String>, String) {
 
     let stdout_buf = stdout_thread.join().unwrap_or_default();
     let stderr_buf = stderr_thread.join().unwrap_or_default();
+    let elapsed = start.elapsed();
 
     if let Some(e) = wait_err {
-        return (None, e);
+        return (None, format!("{e} ({elapsed:?})"));
     }
 
     match status {
@@ -137,29 +139,24 @@ fn exec_debug(args: &[&str]) -> (Option<String>, String) {
             let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
             let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
             if status.success() {
-                (Some(stdout.clone()), format!("ok ({} bytes)", stdout.len()))
+                (Some(stdout.clone()), format!("ok ({} bytes, {elapsed:?})", stdout.len()))
             } else {
-                let detail = if stderr.is_empty() { format!("exit {}", status) } else { stderr.trim().to_string() };
-                (None, detail)
+                let detail = if stderr.is_empty() { format!("exit {status}") } else { stderr.trim().to_string() };
+                (None, format!("{detail} ({elapsed:?})"))
             }
         }
-        None => (None, format!("`{}` timed out after {:?}", args.join(" "), EXEC_TIMEOUT)),
+        None => (None, format!("`{}` timed out after {elapsed:?}", args.join(" "))),
     }
 }
 
+// Delegates to exec_debug so add/delete-rule and firewall-toggle commands
+// get the same subprocess timeout and detailed (stderr + elapsed) error
+// text as the data-gathering paths, instead of `cmd.output()`'s unbounded
+// wait and bare stderr.
 fn exec_checked(args: &[&str]) -> Result<(), String> {
-    if args.is_empty() {
-        return Err("Empty command".into());
-    }
-    let mut cmd = Command::new(args[0]);
-    cmd.args(&args[1..]);
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let out = cmd.output().map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    match exec_debug(args) {
+        (Some(_), _) => Ok(()),
+        (None, detail) => Err(detail),
     }
 }
 
@@ -341,39 +338,69 @@ fn gather_wsl_ports() -> (HashSet<u16>, Vec<String>) {
     (HashSet::new(), log)
 }
 
+// `Get-NetFirewallRule | ForEach-Object { $_ | Get-NetFirewallPortFilter }`
+// (the previous version of this script) calls Get-NetFirewallPortFilter once
+// PER RULE — each call has real CIM overhead, and a typical Windows box has
+// 100-300+ enabled inbound Allow rules, so that pattern alone can take
+// 10-30+ seconds. Fetch rules and port filters in two bulk calls instead and
+// join them in memory via a hashtable keyed by InstanceID — same result,
+// O(1) lookups, typically well under a second.
 const FIREWALL_LIST_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 try {
-    Get-NetFirewallRule -Direction Inbound | Where-Object { $_.Enabled -eq 'True' -and $_.Action -eq 'Allow' } | ForEach-Object { $_ | Get-NetFirewallPortFilter } | ForEach-Object { "$($_.Protocol)|$($_.LocalPort -join ',')" }
+    $filters = @{}
+    Get-NetFirewallPortFilter | ForEach-Object { $filters[$_.InstanceID] = $_ }
+    Get-NetFirewallRule -Direction Inbound -Enabled True -Action Allow | ForEach-Object {
+        $f = $filters[$_.InstanceID]
+        if ($f) { "$($f.Protocol)|$($f.LocalPort -join ',')" }
+    }
 } catch {
     Write-Error $_
     exit 1
 }
 "#;
 
-fn gather_firewall_rules() -> (Vec<(String, String)>, Option<String>) {
-    match exec(&["powershell", "-NoProfile", "-NonInteractive", "-Command", FIREWALL_LIST_SCRIPT]) {
-        Some(out) => (parse_firewall_ports(&out), None),
-        None => (Vec::new(), Some("Get-NetFirewallRule failed — could not read firewall rules".to_string())),
+fn gather_firewall_rules() -> (Vec<(String, String)>, Option<String>, String) {
+    let (out, detail) = exec_debug(&["powershell", "-NoProfile", "-NonInteractive", "-Command", FIREWALL_LIST_SCRIPT]);
+    match out {
+        Some(out) => {
+            let rules = parse_firewall_ports(&out);
+            let log = format!("[firewall] {} → {} rules", detail, rules.len());
+            (rules, None, log)
+        }
+        None => {
+            let log = format!("[firewall] failed: {detail}");
+            let err = format!("Get-NetFirewallRule failed — could not read firewall rules ({detail})");
+            (Vec::new(), Some(err), log)
+        }
     }
 }
 
-fn gather_docker_containers() -> Vec<DockerContainer> {
+fn gather_docker_containers() -> (Vec<DockerContainer>, Vec<String>) {
     let fmt = "{{.ID}} {{.Names}} {{.Ports}}";
     let fallbacks: &[&[&str]] = &[
         &["docker", "ps", "--format", fmt],
         &["wsl", "docker", "ps", "--format", fmt],
         &["wsl", "-u", "root", "docker", "ps", "--format", fmt],
     ];
+    let mut log = Vec::new();
     for cmd in fallbacks {
-        if let Some(out) = exec(cmd) {
-            let containers = parse_docker_output(&out);
-            if !containers.is_empty() {
-                return containers;
+        let label = cmd.join(" ");
+        let (out, detail) = exec_debug(cmd);
+        match out {
+            Some(out) => {
+                let containers = parse_docker_output(&out);
+                log.push(format!("[docker] `{}` → {}, {} containers found", label, detail, containers.len()));
+                if !containers.is_empty() {
+                    return (containers, log);
+                }
+            }
+            None => {
+                log.push(format!("[docker] `{}` → failed: {}", label, detail));
             }
         }
     }
-    Vec::new()
+    (Vec::new(), log)
 }
 
 // ── Tauri commands ───────────────────────────────────────────────────────────
@@ -408,7 +435,9 @@ async fn get_wsl_ip() -> Result<String, String> {
 async fn get_all_data() -> AllData {
     use tauri::async_runtime::spawn_blocking;
 
+    let all_start = Instant::now();
     let mut errors = Vec::new();
+    let mut debug_log = Vec::new();
 
     // These four data sources are independent (netsh, WSL, Docker, and the
     // firewall each spawn their own subprocess) but were previously queried
@@ -419,14 +448,18 @@ async fn get_all_data() -> AllData {
     // means a panic in any one of these surfaces as an `Err` we can log into
     // `errors`, instead of taking down the whole command — and the pool is
     // bounded, unlike spawning threads directly.
-    let netsh_task = spawn_blocking(|| exec(&["netsh", "interface", "portproxy", "show", "all"]));
+    let netsh_task = spawn_blocking(|| exec_debug(&["netsh", "interface", "portproxy", "show", "all"]));
     let wsl_task = spawn_blocking(gather_wsl_ports);
     let docker_task = spawn_blocking(gather_docker_containers);
     let fw_task = spawn_blocking(gather_firewall_rules);
 
     let netsh_raw = match netsh_task.await {
-        Ok(Some(s)) => s,
-        Ok(None) => {
+        Ok((Some(s), detail)) => {
+            debug_log.push(format!("[netsh] {detail}"));
+            s
+        }
+        Ok((None, detail)) => {
+            debug_log.push(format!("[netsh] failed: {detail}"));
             errors.push("netsh failed — ensure the app runs as Administrator".to_string());
             String::new()
         }
@@ -439,14 +472,19 @@ async fn get_all_data() -> AllData {
         errors.push(format!("WSL port scan task failed: {e}"));
         (HashSet::new(), Vec::new())
     });
-    let docker_containers = docker_task.await.unwrap_or_else(|e| {
+    debug_log.extend(wsl_log);
+    let (docker_containers, docker_log) = docker_task.await.unwrap_or_else(|e| {
         errors.push(format!("Docker scan task failed: {e}"));
-        Vec::new()
+        (Vec::new(), Vec::new())
     });
-    let (fw_rules, fw_error) = fw_task.await.unwrap_or_else(|e| {
+    debug_log.extend(docker_log);
+    let (fw_rules, fw_error, fw_log) = fw_task.await.unwrap_or_else(|e| {
         errors.push(format!("Firewall scan task failed: {e}"));
-        (Vec::new(), None)
+        (Vec::new(), None, String::new())
     });
+    if !fw_log.is_empty() {
+        debug_log.push(fw_log);
+    }
     if let Some(e) = fw_error {
         errors.push(e);
     }
@@ -458,6 +496,8 @@ async fn get_all_data() -> AllData {
     // bounded blocking pool rather than one raw OS thread per rule. Shared
     // read-only state is wrapped in Arc since spawn_blocking closures must
     // be 'static and can't borrow from the stack like thread::scope could.
+    let rule_count = raw_rules.len();
+    let probe_start = Instant::now();
     let fw_rules = Arc::new(fw_rules);
     let wsl_ports = Arc::new(wsl_ports);
     let docker_containers = Arc::new(docker_containers);
@@ -519,6 +559,7 @@ async fn get_all_data() -> AllData {
             Err(e) => errors.push(format!("Rule probe task failed: {e}")),
         }
     }
+    debug_log.push(format!("[probes] {rule_count} rules in {:?}", probe_start.elapsed()));
 
     let wsl_ports = Arc::try_unwrap(wsl_ports).unwrap_or_else(|arc| (*arc).clone());
     let docker_containers = Arc::try_unwrap(docker_containers).unwrap_or_else(|arc| (*arc).clone());
@@ -526,12 +567,14 @@ async fn get_all_data() -> AllData {
     let mut wsl_ports_vec: Vec<u16> = wsl_ports.into_iter().collect();
     wsl_ports_vec.sort_unstable();
 
+    debug_log.push(format!("[get_all_data] total {:?}", all_start.elapsed()));
+
     AllData {
         rules,
         wsl_ports: wsl_ports_vec,
         docker_containers,
         errors,
-        debug_log: wsl_log,
+        debug_log,
     }
 }
 
