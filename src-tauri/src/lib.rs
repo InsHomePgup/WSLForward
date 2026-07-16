@@ -1,8 +1,10 @@
 use std::collections::HashSet;
+use std::io::Read;
 use std::net::ToSocketAddrs;
 use std::net::TcpStream;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "windows")]
@@ -63,26 +65,85 @@ fn exec(args: &[&str]) -> Option<String> {
     exec_debug(args).0
 }
 
+const EXEC_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn exec_debug(args: &[&str]) -> (Option<String>, String) {
     if args.is_empty() {
         return (None, "empty command".into());
     }
     let mut cmd = Command::new(args[0]);
     cmd.args(&args[1..]);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
-    match cmd.output() {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-            if out.status.success() {
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return (None, e.to_string()),
+    };
+
+    // Drain stdout/stderr on separate threads while we poll for exit, so a
+    // chatty process can't fill its pipe buffer and stall (and so killing it
+    // on timeout below reliably unblocks these reads via EOF).
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = stdout_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = stderr_pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + EXEC_TIMEOUT;
+    let mut wait_err = None;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                wait_err = Some(e.to_string());
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+
+    let stdout_buf = stdout_thread.join().unwrap_or_default();
+    let stderr_buf = stderr_thread.join().unwrap_or_default();
+
+    if let Some(e) = wait_err {
+        return (None, e);
+    }
+
+    match status {
+        Some(status) => {
+            let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+            let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+            if status.success() {
                 (Some(stdout.clone()), format!("ok ({} bytes)", stdout.len()))
             } else {
-                let detail = if stderr.is_empty() { format!("exit {}", out.status) } else { stderr.trim().to_string() };
+                let detail = if stderr.is_empty() { format!("exit {}", status) } else { stderr.trim().to_string() };
                 (None, detail)
             }
         }
-        Err(e) => (None, e.to_string()),
+        None => (None, format!("`{}` timed out after {:?}", args.join(" "), EXEC_TIMEOUT)),
     }
 }
 
@@ -345,67 +406,122 @@ async fn get_wsl_ip() -> Result<String, String> {
 
 #[tauri::command]
 async fn get_all_data() -> AllData {
+    use tauri::async_runtime::spawn_blocking;
+
     let mut errors = Vec::new();
 
-    let netsh_raw = exec(&["netsh", "interface", "portproxy", "show", "all"])
-        .unwrap_or_else(|| {
+    // These four data sources are independent (netsh, WSL, Docker, and the
+    // firewall each spawn their own subprocess) but were previously queried
+    // one after another; running them concurrently on tauri's blocking pool
+    // turns the total wait into "the slowest one" instead of "the sum of all
+    // of them" — the WSL/Docker calls in particular can take seconds if
+    // those VMs are cold. Using spawn_blocking (rather than raw OS threads)
+    // means a panic in any one of these surfaces as an `Err` we can log into
+    // `errors`, instead of taking down the whole command — and the pool is
+    // bounded, unlike spawning threads directly.
+    let netsh_task = spawn_blocking(|| exec(&["netsh", "interface", "portproxy", "show", "all"]));
+    let wsl_task = spawn_blocking(gather_wsl_ports);
+    let docker_task = spawn_blocking(gather_docker_containers);
+    let fw_task = spawn_blocking(gather_firewall_rules);
+
+    let netsh_raw = match netsh_task.await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
             errors.push("netsh failed — ensure the app runs as Administrator".to_string());
             String::new()
-        });
-
-    let (wsl_ports, wsl_log) = gather_wsl_ports();
-    let docker_containers = gather_docker_containers();
-    let raw_rules = parse_netsh(&netsh_raw);
-
-    let (fw_rules, fw_error) = gather_firewall_rules();
+        }
+        Err(e) => {
+            errors.push(format!("netsh task failed: {e}"));
+            String::new()
+        }
+    };
+    let (wsl_ports, wsl_log) = wsl_task.await.unwrap_or_else(|e| {
+        errors.push(format!("WSL port scan task failed: {e}"));
+        (HashSet::new(), Vec::new())
+    });
+    let docker_containers = docker_task.await.unwrap_or_else(|e| {
+        errors.push(format!("Docker scan task failed: {e}"));
+        Vec::new()
+    });
+    let (fw_rules, fw_error) = fw_task.await.unwrap_or_else(|e| {
+        errors.push(format!("Firewall scan task failed: {e}"));
+        (Vec::new(), None)
+    });
     if let Some(e) = fw_error {
         errors.push(e);
     }
 
-    let rules = raw_rules
+    let raw_rules = parse_netsh(&netsh_raw);
+
+    // Per-rule TCP reachability probes are the other bottleneck (each can
+    // take up to 500ms) — probe all rules concurrently too, on the same
+    // bounded blocking pool rather than one raw OS thread per rule. Shared
+    // read-only state is wrapped in Arc since spawn_blocking closures must
+    // be 'static and can't borrow from the stack like thread::scope could.
+    let fw_rules = Arc::new(fw_rules);
+    let wsl_ports = Arc::new(wsl_ports);
+    let docker_containers = Arc::new(docker_containers);
+
+    let rule_tasks: Vec<_> = raw_rules
         .into_iter()
         .map(|(la, lp, ca, cp)| {
-            let check_host = if la == "0.0.0.0" || la == "*" {
-                "127.0.0.1"
-            } else {
-                &la
-            };
-            let lp_u16: u16 = lp.parse().unwrap_or(0);
-            let win_open = lp.parse::<u16>().map(|p| port_open(check_host, p)).unwrap_or(false);
-            let firewall_open = firewall_port_open(&fw_rules, lp_u16);
-            let cp_u16: u16 = cp.parse().unwrap_or(0);
-            let wsl_running = wsl_ports.contains(&cp_u16);
+            let fw_rules = fw_rules.clone();
+            let wsl_ports = wsl_ports.clone();
+            let docker_containers = docker_containers.clone();
+            spawn_blocking(move || {
+                let check_host = if la == "0.0.0.0" || la == "*" {
+                    "127.0.0.1"
+                } else {
+                    &la
+                };
+                let lp_u16: u16 = lp.parse().unwrap_or(0);
+                let win_open = lp.parse::<u16>().map(|p| port_open(check_host, p)).unwrap_or(false);
+                let firewall_open = firewall_port_open(&fw_rules, lp_u16);
+                let cp_u16: u16 = cp.parse().unwrap_or(0);
+                let wsl_running = wsl_ports.contains(&cp_u16);
 
-            let docker_matches = docker_containers
-                .iter()
-                .flat_map(|c| {
-                    c.ports.iter().filter_map(|p| {
-                        if p.host_port == cp_u16 || p.container_port == Some(cp_u16) {
-                            Some(DockerMatch {
-                                name: c.name.clone(),
-                                host_port: p.host_port,
-                                container_port: p.container_port,
-                                proto: p.proto.clone(),
-                            })
-                        } else {
-                            None
-                        }
+                let docker_matches = docker_containers
+                    .iter()
+                    .flat_map(|c| {
+                        c.ports.iter().filter_map(|p| {
+                            if p.host_port == cp_u16 || p.container_port == Some(cp_u16) {
+                                Some(DockerMatch {
+                                    name: c.name.clone(),
+                                    host_port: p.host_port,
+                                    container_port: p.container_port,
+                                    proto: p.proto.clone(),
+                                })
+                            } else {
+                                None
+                            }
+                        })
                     })
-                })
-                .collect();
+                    .collect();
 
-            PortProxyRule {
-                listen_addr: la,
-                listen_port: lp,
-                connect_addr: ca,
-                connect_port: cp,
-                win_open,
-                firewall_open,
-                wsl_running,
-                docker_matches,
-            }
+                PortProxyRule {
+                    listen_addr: la,
+                    listen_port: lp,
+                    connect_addr: ca,
+                    connect_port: cp,
+                    win_open,
+                    firewall_open,
+                    wsl_running,
+                    docker_matches,
+                }
+            })
         })
         .collect();
+
+    let mut rules = Vec::with_capacity(rule_tasks.len());
+    for task in rule_tasks {
+        match task.await {
+            Ok(rule) => rules.push(rule),
+            Err(e) => errors.push(format!("Rule probe task failed: {e}")),
+        }
+    }
+
+    let wsl_ports = Arc::try_unwrap(wsl_ports).unwrap_or_else(|arc| (*arc).clone());
+    let docker_containers = Arc::try_unwrap(docker_containers).unwrap_or_else(|arc| (*arc).clone());
 
     let mut wsl_ports_vec: Vec<u16> = wsl_ports.into_iter().collect();
     wsl_ports_vec.sort_unstable();
